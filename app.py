@@ -1,4 +1,3 @@
-import math
 import torch
 import torch.nn as nn
 import streamlit as st
@@ -31,14 +30,14 @@ st.markdown("""
         text-align: center;
         font-size: 1.05rem;
         color: #cbd5e1;
-        margin-bottom: 2rem;
+        margin-bottom: 1.5rem;
     }
 </style>
 """, unsafe_allow_html=True)
 
 st.markdown('<div class="main-title">🎨 DDPM Image Generator</div>', unsafe_allow_html=True)
 st.markdown(
-    '<div class="sub-title">Generate images from random noise using your trained PyTorch DDPM model.</div>',
+    '<div class="sub-title">This DDPM model generates new images from random noise. No image upload is needed.</div>',
     unsafe_allow_html=True
 )
 
@@ -67,10 +66,15 @@ class TimeBlock(nn.Module):
 
     def forward(self, t):
         half = self.size // 2
-        vals = torch.arange(half, device=t.device).float()
-        vals = torch.exp(-math.log(10000) * vals / (half - 1))
-        vals = t.float().unsqueeze(1) * vals.unsqueeze(0)
-        emb = torch.cat([torch.sin(vals), torch.cos(vals)], dim=1)
+
+        nums = torch.arange(half, device=t.device).float()
+        nums = nums / half
+
+        emb = 1.0 / (10000 ** nums)
+        emb = t.float().unsqueeze(1) * emb.unsqueeze(0)
+
+        emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=1)
+
         return emb
 
 
@@ -80,33 +84,35 @@ class ResBlock(nn.Module):
 
         self.conv1 = nn.Conv2d(in_ch, out_ch, 3, padding=1)
         self.norm1 = nn.GroupNorm(8, out_ch)
-        self.act1 = nn.SiLU()
-
-        self.time_fc = nn.Linear(time_ch, out_ch)
 
         self.conv2 = nn.Conv2d(out_ch, out_ch, 3, padding=1)
         self.norm2 = nn.GroupNorm(8, out_ch)
-        self.act2 = nn.SiLU()
+
+        self.time_layer = nn.Linear(time_ch, out_ch)
 
         if in_ch != out_ch:
-            self.short = nn.Conv2d(in_ch, out_ch, 1)
+            self.skip = nn.Conv2d(in_ch, out_ch, 1)
         else:
-            self.short = nn.Identity()
+            self.skip = nn.Identity()
+
+        self.act = nn.SiLU()
 
     def forward(self, x, t):
         h = self.conv1(x)
         h = self.norm1(h)
-        h = self.act1(h)
+        h = self.act(h)
 
-        time_add = self.time_fc(t).unsqueeze(-1).unsqueeze(-1)
-        h = h + time_add
+        time_value = self.time_layer(t)
+        time_value = time_value[:, :, None, None]
+
+        h = h + time_value
 
         h = self.conv2(h)
         h = self.norm2(h)
 
-        h = h + self.short(x)
-        h = self.act2(h)
-        return h
+        x = self.skip(x)
+
+        return self.act(h + x)
 
 
 class SimpleUNet(nn.Module):
@@ -115,51 +121,68 @@ class SimpleUNet(nn.Module):
 
         time_ch = 128
 
+        self.time_make = TimeBlock(time_ch)
+
         self.time_mlp = nn.Sequential(
-            TimeBlock(time_ch),
             nn.Linear(time_ch, time_ch),
-            nn.SiLU()
+            nn.SiLU(),
+            nn.Linear(time_ch, time_ch)
         )
 
-        self.first = nn.Conv2d(3, 64, 3, padding=1)
+        self.start = nn.Conv2d(3, 64, 3, padding=1)
 
-        self.down1 = ResBlock(64, 64, time_ch)
-        self.pool1 = nn.Conv2d(64, 64, 4, 2, 1)
+        self.down_block1 = ResBlock(64, 64, time_ch)
+        self.down_block1_more = ResBlock(64, 64, time_ch)
+        self.down1 = nn.Conv2d(64, 128, 4, stride=2, padding=1)
 
-        self.down2 = ResBlock(64, 128, time_ch)
-        self.pool2 = nn.Conv2d(128, 128, 4, 2, 1)
+        self.down_block2 = ResBlock(128, 128, time_ch)
+        self.down_block2_more = ResBlock(128, 128, time_ch)
+        self.down2 = nn.Conv2d(128, 256, 4, stride=2, padding=1)
 
-        self.mid = ResBlock(128, 256, time_ch)
+        self.mid_block1 = ResBlock(256, 256, time_ch)
+        self.mid_block2 = ResBlock(256, 256, time_ch)
+        self.mid_block3 = ResBlock(256, 256, time_ch)
 
-        self.up1 = nn.ConvTranspose2d(256, 128, 4, 2, 1)
-        self.dec1 = ResBlock(256, 128, time_ch)
+        self.up1 = nn.ConvTranspose2d(256, 128, 4, stride=2, padding=1)
+        self.up_block1 = ResBlock(256, 128, time_ch)
+        self.up_block1_more = ResBlock(128, 128, time_ch)
 
-        self.up2 = nn.ConvTranspose2d(128, 64, 4, 2, 1)
-        self.dec2 = ResBlock(128, 64, time_ch)
+        self.up2 = nn.ConvTranspose2d(128, 64, 4, stride=2, padding=1)
+        self.up_block2 = ResBlock(128, 64, time_ch)
+        self.up_block2_more = ResBlock(64, 64, time_ch)
 
         self.last = nn.Conv2d(64, 3, 1)
 
     def forward(self, x, t):
+        t = self.time_make(t)
         t = self.time_mlp(t)
 
-        x1 = self.first(x)
-        x1 = self.down1(x1, t)
+        x = self.start(x)
 
-        x2 = self.pool1(x1)
-        x2 = self.down2(x2, t)
+        h1 = self.down_block1(x, t)
+        h1 = self.down_block1_more(h1, t)
+        x = self.down1(h1)
 
-        x3 = self.pool2(x2)
-        x3 = self.mid(x3, t)
+        h2 = self.down_block2(x, t)
+        h2 = self.down_block2_more(h2, t)
+        x = self.down2(h2)
 
-        x = self.up1(x3)
-        x = torch.cat([x, x2], dim=1)
-        x = self.dec1(x, t)
+        x = self.mid_block1(x, t)
+        x = self.mid_block2(x, t)
+        x = self.mid_block3(x, t)
+
+        x = self.up1(x)
+        x = torch.cat([x, h2], dim=1)
+        x = self.up_block1(x, t)
+        x = self.up_block1_more(x, t)
 
         x = self.up2(x)
-        x = torch.cat([x, x1], dim=1)
-        x = self.dec2(x, t)
+        x = torch.cat([x, h1], dim=1)
+        x = self.up_block2(x, t)
+        x = self.up_block2_more(x, t)
 
         x = self.last(x)
+
         return x
 
 
@@ -171,7 +194,12 @@ def load_model():
     )
 
     model = SimpleUNet().to(device)
+
     state = torch.load(model_path, map_location=device)
+
+    if isinstance(state, dict) and "model" in state:
+        state = state["model"]
+
     model.load_state_dict(state)
     model.eval()
     return model
@@ -192,6 +220,7 @@ def generate_images(model, total=1):
 
     for i in reversed(range(time_steps)):
         t = torch.full((x.shape[0],), i, device=device).long()
+
         pred_noise = model(x, t)
 
         b = beta[i]
@@ -208,6 +237,7 @@ def generate_images(model, total=1):
     pics = []
     for j in range(total):
         pics.append(tensor_to_pil(x[j:j+1]))
+
     return pics
 
 
@@ -218,6 +248,7 @@ with st.sidebar:
     st.write(f"Diffusion steps: {time_steps}")
     st.write("Model repo: supremeproducts45/ddpm")
 
+st.info("This model does not need image upload. Just click the button below to generate new images from random noise.")
 
 st.title("Generate DDPM Images")
 
