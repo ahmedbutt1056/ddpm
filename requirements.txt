@@ -1,0 +1,5 @@
+streamlit
+torch
+huggingface_hub
+pillow
+numpy
